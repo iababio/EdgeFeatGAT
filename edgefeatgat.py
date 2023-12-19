@@ -7,6 +7,8 @@ Original file is located at
     https://colab.research.google.com/drive/1B1bO9pPRmQZgIlgjqEQROaoNHb0gAY4x
 """
 
+!pip install torch_geometric
+
 import torch
 import torch.nn as nn
 from torch.nn import Linear, Parameter
@@ -17,11 +19,13 @@ from torch_geometric.transforms import ToSparseTensor
 from torch_geometric.utils import add_self_loops, degree
 from torch_geometric.datasets import TUDataset, Planetoid
 from sklearn.model_selection import train_test_split
+from torch_geometric.nn import global_mean_pool
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 class CustomGraphDataset(torch.utils.data.Dataset):
     def __init__(self, mutag, protein):
         self.mutag = TUDataset(root='/tmp/MUTAG', name='MUTAG') if mutag else None
-        self.protein = Planetoid(root='/tmp/Protein', name='Protein') if protein else None
+        self.protein = TUDataset(root='/tmp/PROTEINS', name='PROTEINS') if protein else None
 
     def __len__(self):
         return len(self.mutag) if self.mutag is not None else len(self.protein)
@@ -44,68 +48,106 @@ train_dataset, test_dataset = train_test_split(dataset, test_size=0.2, random_st
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=32)
 
-class EGConv(MessagePassing):
-    def __init__(self, node_feature_dim, edge_feature_dim, hidden_dim, num_heads):
-        super(EGConv, self).__init__(aggr='add')  # "Add" aggregation (Step 5).
+for batch in train_loader:
+    print(batch.edge_attr.shape)
+    break
 
-        # EdgeCNN for processing edge features
+class EGConv(MessagePassing):
+    def __init__(self, node_feature_dim, edge_feature_dim, hidden_dim):
+        super(EGConv, self).__init__(aggr='add')
+
+        self.edge_transform = Linear(edge_feature_dim, hidden_dim)
+
+        # Add dropout in the edge_cnn layers
         self.edge_cnn = nn.Sequential(
-            Linear(edge_feature_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(0.5), # Add dropout layer
             Linear(hidden_dim, hidden_dim)
         )
 
-        # GAT layer for processing node and edge features
+        # Add a dropout to the input features before the GAT layer
+        self.dropout = nn.Dropout(0.5)
+
+        # Increase the number of heads in the GATConv. This increases model capacity
         self.gat = GATConv(
-            in_channels=node_feature_dim + hidden_dim,
+            in_channels=node_feature_dim,
             out_channels=hidden_dim,
-            heads=num_heads,
-            concat=True
+            heads=8 # Increase number of heads
         )
 
-    def forward(self, x, edge_index, edge_attr):
-        # EdgeCNN processing is done dynamically in the message function.
-        # Apply GAT layer afterwards.
+    def forward(self, x, edge_index, edge_attr, batch):
+        edge_attr = self.edge_transform(edge_attr)
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-        return self.gat(x, edge_index)
 
-    def message(self, x_j, edge_index_i, edge_attr):
-        # Apply EdgeCNN in the message function
-        edge_attr = self.edge_cnn(edge_attr)
+        x = self.dropout(x) # Apply dropout to input features
+        graph_features = self.gat(x, edge_index)
 
-        # Concatenate edge and node features
-        x_j = torch.cat([x_j, edge_attr], dim=1)
+        graph_features = global_mean_pool(graph_features, batch)
 
-        return x_j
+        return graph_features
 
-# Instantiate the model
-node_feature_dim = 64
-edge_feature_dim = 16
+node_feature_dim = 7 # node features
+edge_feature_dim = 4 # edge features
 hidden_dim = 128
-num_heads = 4
-model = EdgeGAT(node_feature_dim, edge_feature_dim, hidden_dim, num_heads)
+model = EGConv(node_feature_dim, edge_feature_dim, hidden_dim)
+
 
 # Loss function and optimizer
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.70001 + 1e-4)
 
 # Create a DataLoader for your dataset
-dataset = CustomGraphDataset()
+# Create a DataLoader for your dataset
+dataset = CustomGraphDataset(mutag=True, protein=True)
 loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
 # Training loop
-num_epochs = 10
+num_epochs = 100
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.01)
+
 for epoch in range(num_epochs):
     model.train()
     for data in loader:
         optimizer.zero_grad()
-        out = model(data.x, data.edge_index, data.edge_attr)
+        out = model(data.x, data.edge_index, data.edge_attr, data.batch)
         loss = criterion(out, data.y)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
     # Print or log the training loss at the end of each epoch
     print(f"Epoch {epoch + 1}, Loss: {loss.item()}")
 
 # Evaluation (you may need a separate validation dataset)
 model.eval()
+
+# Initialize a list to hold all predictions and true labels
+all_preds = []
+all_labels = []
+
+for data in test_loader:
+    # Pass each batch through the model
+    out = model(data.x, data.edge_index, data.edge_attr, data.batch)
+
+    # Get the prediction
+    # Since your task is multi-class, choose the class with the highest output as the prediction
+    pred = out.argmax(dim=1)
+
+    # Save prediction and labels
+    all_preds.extend(pred.tolist())
+    all_labels.extend(data.y.tolist())
+
+# Convert to lists
+all_preds = [int(i) for i in all_preds]
+all_labels = [int(i) for i in all_labels]
+
+# Calculate metrics
+accuracy = accuracy_score(all_labels, all_preds)
+precision = precision_score(all_labels, all_preds, average='weighted')  # set average='weighted' to calculate for multi-class/multi-label problems
+recall = recall_score(all_labels, all_preds, average='weighted')  # set average='weighted' to calculate for multi-class/multi-label problems
+f1 = f1_score(all_labels, all_preds, average='weighted')  # set average='weighted' to calculate for multi-class/multi-label problems
+
+print('Accuracy: ', accuracy)
+print('Precision: ', precision)
+print('Recall: ', recall)
+print('F1 Score: ', f1)
